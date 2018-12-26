@@ -21,27 +21,19 @@ from net import SiameseRPN
 from torch.nn import init
 from shapely.geometry import Polygon
 
+
 parser = argparse.ArgumentParser(description='PyTorch SiameseRPN Training')
-
-parser.add_argument('--train_path', default='/home/song/srpn/dataset/vot13', metavar='DIR',help='path to dataset')
-
-parser.add_argument('--weight_dir', default='/home/song/srpn/weight', metavar='DIR',help='path to weight')
-
+parser.add_argument('--train_path', default='/home/whikwon/Documents/github/Siamese-RPN-pytorch/vot2013/catheter', metavar='DIR',help='path to dataset')
+parser.add_argument('--weight_dir', default='/home/whikwon/Documents/github/Siamese-RPN-pytorch/weight', metavar='DIR',help='path to weight')
 parser.add_argument('--checkpoint_path', default=None, help='resume')
-
 parser.add_argument('--max_epoches', default=10000, type=int, metavar='N', help='number of total epochs to run')
-
 parser.add_argument('--max_batches', default=0, type=int, metavar='N', help='number of batch in one epoch')
-
 parser.add_argument('--init_type',  default='xavier', type=str, metavar='INIT', help='init net')
-
 parser.add_argument('--lr', default=0.001, type=float, metavar='LR', help='initial learning rate')
-
 parser.add_argument('--momentum', default=0.9, type=float, metavar='momentum', help='momentum')
-
 parser.add_argument('--weight_decay', '--wd', default=5e-5, type=float, metavar='W', help='weight decay (default: 1e-4)')
-
 parser.add_argument('--debug', default=False, type=bool,  help='whether to debug')
+
 
 def main():
     """ train dataloader """
@@ -85,9 +77,9 @@ def main():
     steps = 0
     for epoch in range(start, args.max_epoches):
         cur_lr = adjust_learning_rate(args.lr, optimizer, epoch, gamma=0.1)
-        index_list = range(data_loader.__len__()) 
+        index_list = range(data_loader.__len__())
         for example in range(args.max_batches):
-            ret = data_loader.__get__(random.choice(index_list)) 
+            ret = data_loader.__get__(random.choice(index_list))
             template = ret['template_tensor'].cuda()
             detection= ret['detection_tensor'].cuda()
             pos_neg_diff = ret['pos_neg_diff_tensor'].cuda()
@@ -96,7 +88,7 @@ def main():
             closs, rloss, loss, reg_pred, reg_target, pos_index, neg_index = criterion(predictions, targets)
             closs_ = closs.cpu().item()
 
-            if np.isnan(closs_): 
+            if np.isnan(closs_):
                sys.exit(0)
 
             closses.update(closs.cpu().item())
@@ -108,12 +100,12 @@ def main():
             optimizer.step()
             steps += 1
 
-                        
             cout = cout.cpu().detach().numpy()
-            score = 1/(1 + np.exp(cout[:,0]-cout[:,1]))
+            score = 1/(1 + np.exp(cout[:,0]-cout[:,1]))  # ?
 
             # ++++++++++++ post process below just for debug ++++++++++++++++++++++++
             # ++++++++++++++++++++ v1.0 add penalty +++++++++++++++++++++++++++++++++
+            # 1. second proposal selection
             if ret['pos_anchors'] is not None:
                 penalty_k = 0.055
                 tx, ty, tw, th = ret['template_target_xywh'].copy()
@@ -141,7 +133,7 @@ def main():
             score = pscore #from 0.2 - 0.7
 
             # +++++++++++++++++++ v1.0 add nms ++++++++++++++++++++++++++++++++++++++++++++
-            nms = False
+            nms = True
             nms_threshold = 0.6
             start = time.time()
             anchors = ret['anchors'].copy()
@@ -170,15 +162,14 @@ def main():
             # print(score[pos_index])  # this should tend to be 1
             # print(score[neg_index])  # this should tend to be 0
 
-
             # ++++++++++++++++++++ debug for reg ++++++++++++++++++++++++++++++++++++++
-            tmp_dir = '/home/song/srpn/tmp/visualization/7_check_train_phase_debug_pos_anchors'
+            tmp_dir = '/home/whikwon/Documents/github/Siamese-RPN-pytorch/7_check_train_phase_debug_pos_anchors'
             if not os.path.exists(tmp_dir):
                 os.makedirs(tmp_dir)
             detection = ret['detection_cropped_resized'].copy()
             draw = ImageDraw.Draw(detection)
             pos_anchors = ret['pos_anchors'].copy() if ret['pos_anchors'] is not None else None
-            
+
             if pos_anchors is not None:
                 # draw pos anchors
                 x = pos_anchors[:, 0]
@@ -199,7 +190,7 @@ def main():
                 for i in range(16):
                     x1, y1, x2, y2 = x1s[i], y1s[i], x2s[i], y2s[i]
                     draw.line([(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)], width=1, fill='red')  # predict(white -> red)
-                
+
                 # pos anchor should be transformed to green gt box, if red and green is same, it is overfitting
                 x = pos_anchors[:,0] + pos_anchors[:, 2] * reg_target[pos_index, 0].cpu().detach().numpy()
                 y = pos_anchors[:,1] + pos_anchors[:, 3] * reg_target[pos_index, 1].cpu().detach().numpy()
@@ -220,7 +211,7 @@ def main():
             save_path = osp.join(tmp_dir, 'epoch_{:010d}_{:010d}_anchor_pred.jpg'.format(epoch, example))
             detection.save(save_path)
 
-            
+
             # +++++++++++++++++++ v1.0 restore ++++++++++++++++++++++++++++++++++++++++
             ratio = ret['detection_cropped_resized_ratio']
             detection_cropped = ret['detection_cropped'].copy()
@@ -241,10 +232,10 @@ def main():
             draw.line([(x1, y1), (x3, y1), (x3, y3), (x1, y3), (x1, y1)], width=3, fill='yellow')
             save_path = osp.join(tmp_dir, 'epoch_{:010d}_{:010d}_restore.jpg'.format(epoch, example))
             original.save(save_path)
-            
+
             print("Epoch:{:04d}\texample:{:06d}/{:06d}({:.2f})%\tsteps:{:010d}\tlr:{:.7f}\tcloss:{:.4f}\trloss:{:.4f}\ttloss:{:.4f}".format(epoch, example+1, args.max_batches, 100*(example+1)/args.max_batches, steps, cur_lr, closses.avg, rlosses.avg, tlosses.avg ))
 
-        if steps % 10000 == 0:
+        if steps % 10 == 0:
             file_path = os.path.join(args.weight_dir, 'weights-{:07d}.pth.tar'.format(steps))
             state = {
             'epoch' :epoch+1,
@@ -301,7 +292,7 @@ def init_weights(net, init_type='normal', gain=0.02):
                 init.orthogonal_(m.weight.data, gain=gain)
             else:
                 raise NotImplementedError('initialization method [%s] is not implemented' % init_type)
-            
+
             if hasattr(m, 'bias') and m.bias is not None:
                 init.constant_(m.bias.data, 0.0)
         elif classname.find('BatchNorm2d') != -1:
@@ -362,5 +353,5 @@ def adjust_learning_rate(lr, optimizer, epoch, gamma=0.1):
 
 if __name__ == '__main__':
     main()
- 
+
 

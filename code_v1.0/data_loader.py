@@ -6,6 +6,7 @@
 import sys
 import os
 import os.path as osp
+import glob
 import time
 import cv2
 import torch
@@ -27,11 +28,11 @@ class Anchor_ms(object):
         self.scale  = [1/3, 1/2, 1, 2, 3]  # aspect ratio
         self.anchors= self.gen_anchors()   # xywh
         self.eps    = 0.01
-    
+
     def gen_single_anchor(self):
         scale = np.array(self.scale, dtype = np.float32)
         s = self.base * self.base
-        w, h = np.sqrt(s/scale), np.sqrt(s*scale) 
+        w, h = np.sqrt(s/scale), np.sqrt(s*scale)
         c_x, c_y = (self.stride-1)//2, (self.stride-1)//2
         anchor = np.vstack([c_x*np.ones_like(scale, dtype=np.float32), c_y*np.ones_like(scale, dtype=np.float32), w, h]).transpose()
         anchor = self.center_to_corner(anchor)
@@ -44,7 +45,7 @@ class Anchor_ms(object):
         shift_x, shift_y = np.meshgrid(delta_x, delta_y)
         shifts = np.vstack([shift_x.ravel(), shift_y.ravel(), shift_x.ravel(), shift_y.ravel()]).transpose()
         a = shifts.shape[0]
-        anchors = (anchor.reshape((1,k,4))+shifts.reshape((a,1,4))).reshape((a*k, 4)) # corner format   
+        anchors = (anchor.reshape((1,k,4))+shifts.reshape((a,1,4))).reshape((a*k, 4)) # corner format
         anchors = self.corner_to_center(anchors)
         return anchors
 
@@ -88,7 +89,7 @@ class Anchor_ms(object):
         iou_value = self.iou(an_corner, gt_corner).reshape(-1) #(1445)
         max_iou   = max(iou_value)
         pos, neg  = np.zeros_like(iou_value, dtype=np.int32), np.zeros_like(iou_value, dtype=np.int32)
-        
+
         # pos
         pos_cand = np.argsort(iou_value)[::-1][:30]
         pos_index = np.random.choice(pos_cand, pos_num, replace = False)
@@ -100,7 +101,8 @@ class Anchor_ms(object):
         neg_ind = np.random.choice(neg_cand, neg_num, replace = False)
         neg[neg_ind] = 1
 
-        return pos, neg        
+        return pos, neg
+
 
     def iou(self,box1,box2):
         box1, box2 = box1.copy(), box2.copy()
@@ -120,13 +122,110 @@ class Anchor_ms(object):
         all_square=(box1[:,:,2]-box1[:,:,0])*(box1[:,:,3]-box1[:,:,1])+(box2[:,:,2]-box2[:,:,0])*(box2[:,:,3]-box2[:,:,1])-over_square
         return over_square/all_square
 
+
+class TestDataLoader(object):
+    def __init__(self, img_dir_path, template_target_xywh, out_feature=17):
+        self.anchor_generator = Anchor_ms(out_feature, out_feature)
+        self.anchors = self.anchor_generator.gen_anchors() #centor
+        self.img_dir_path = img_dir_path
+        self.img_list = glob.glob(os.path.join(self.img_dir_path, '*'))
+        self.ret = {}
+        self.ret['template_target_xywh'] = template_target_xywh
+        self.count = 1
+
+    def __get__(self):
+        self._pick_img_pairs()
+        self._pad_crop_resize()
+        self._tranform()
+        self.count += 1
+        return self.ret
+
+    def _pick_img_pairs(self):
+        self.ret['detection_img_path'] = self.img_list[self.count]
+        self.ret['template_img_path'] = self.img_list[0]
+        self.ret['anchors'] = self.anchors
+
+    def _tranform(self):
+        """PIL to Tensor"""
+        template_pil = self.ret['template_cropped_resized'].copy()
+        detection_pil= self.ret['detection_cropped_resized'].copy()
+
+        transform = self.get_transform_for_test()
+        template_tensor = transform(template_pil)
+        detection_tensor= transform(detection_pil)
+        self.ret['template_tensor'] = template_tensor.unsqueeze(0)
+        self.ret['detection_tensor']= detection_tensor.unsqueeze(0)
+
+    def get_transform_for_test(self):
+        transform_list = []
+        transform_list.append(transforms.ToTensor())
+        transform_list.append(transforms.Normalize(mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)))
+        return transforms.Compose(transform_list)
+
+    def _pad_crop_resize(self):
+        template_img, detection_img = Image.open(self.ret['template_img_path']), Image.open(self.ret['detection_img_path'])
+
+        w, h = template_img.size
+        cx, cy, tw, th = self.ret['template_target_xywh']
+        p = round((tw + th)/2, 2)
+        template_square_size  = int(np.sqrt((tw + p)*(th + p))) #a
+        detection_square_size = int(template_square_size * 2)   #A =2a
+
+        # pad
+        detection_lt_x, detection_lt_y = cx - detection_square_size//2, cy - detection_square_size//2
+        detection_rb_x, detection_rb_y = cx + detection_square_size//2, cy + detection_square_size//2
+        left   = -detection_lt_x if detection_lt_x < 0 else 0
+        top    = -detection_lt_y if detection_lt_y < 0 else 0
+        right  =  detection_rb_x - w if detection_rb_x > w else 0
+        bottom =  detection_rb_y - h if detection_rb_y > h else 0
+        padding = tuple(map(int, [left, top, right, bottom]))
+        new_w, new_h = left + right + w, top + bottom + h
+
+        # pad load
+        self.ret['padding'] = padding
+        self.ret['new_template_img_padding_size'] = (new_w, new_h)
+
+        template = Image.open(self.ret['template_img_path'])
+        detection= Image.open(self.ret['detection_img_path'])
+
+        mean_template = tuple(map(round, ImageStat.Stat(template).mean))
+        mean_detection= tuple(map(round, ImageStat.Stat(detection).mean))
+        self.ret['mean_template'] = mean_template
+        self.ret['mean_detection']= mean_detection
+        self.ret['new_template_img_padding'] = ImageOps.expand(template_img,  border=padding, fill=self.ret['mean_template'])
+        self.ret['new_detection_img_padding']= ImageOps.expand(detection_img, border=padding, fill=self.ret['mean_detection'])
+
+        # crop
+        tl = cx + left - template_square_size//2
+        tt = cy + top  - template_square_size//2
+        tr = new_w - tl - template_square_size
+        tb = new_h - tt - template_square_size
+        self.ret['template_cropped'] = ImageOps.crop(self.ret['new_template_img_padding'].copy(), (tl, tt, tr, tb))
+
+        dl = np.clip(cx + left - detection_square_size//2, 0, new_w - detection_square_size)
+        dt = np.clip(cy + top  - detection_square_size//2, 0, new_h - detection_square_size)
+        dr = np.clip(new_w - dl - detection_square_size, 0, new_w - detection_square_size)
+        db = np.clip(new_h - dt - detection_square_size, 0, new_h - detection_square_size )
+        self.ret['detection_cropped']= ImageOps.crop(self.ret['new_detection_img_padding'].copy(), (dl, dt, dr, db))
+
+        self.ret['detection_tlcords_of_original_image'] = (cx - detection_square_size//2 , cy - detection_square_size//2)
+        self.ret['detection_tlcords_of_padding_image']  = (cx - detection_square_size//2 + left, cy - detection_square_size//2 + top)
+        self.ret['detection_rbcords_of_padding_image']  = (cx + detection_square_size//2 + left, cy + detection_square_size//2 + top)
+
+        # resize
+        self.ret['template_cropped_resized'] = self.ret['template_cropped'].copy().resize((127, 127))
+        self.ret['detection_cropped_resized']= self.ret['detection_cropped'].copy().resize((256, 256))
+        self.ret['template_cropprd_resized_ratio'] = round(127/template_square_size, 2)
+        self.ret['detection_cropped_resized_ratio'] = round(256/detection_square_size, 2)
+
+
 class TrainDataLoader(object):
     def __init__(self, img_dir_path, out_feature = 17, max_inter = 80, check = False, tmp_dir = '../tmp/visualization'):
         assert osp.isdir(img_dir_path), 'input img_dir_path error'
         self.anchor_generator = Anchor_ms(out_feature, out_feature)
         self.img_dir_path = img_dir_path # this is a root dir contain subclass
         self.max_inter = max_inter
-        self.sub_class_dir = [sub_class_dir for sub_class_dir in os.listdir(img_dir_path) if os.path.isdir(os.path.join(img_dir_path, sub_class_dir))] 
+        self.sub_class_dir = [sub_class_dir for sub_class_dir in os.listdir(img_dir_path) if os.path.isdir(os.path.join(img_dir_path, sub_class_dir))]
         self.anchors = self.anchor_generator.gen_anchors() #centor
         self.ret = {}
         self.check = check
@@ -146,13 +245,13 @@ class TrainDataLoader(object):
         transform_list.append(transforms.Normalize(mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)))
         return transforms.Compose(transform_list)
 
-    # tuple  
+    # tuple
     def _average(self):
         assert self.ret.__contains__('template_img_path'), 'no template path'
         assert self.ret.__contains__('detection_img_path'),'no detection path'
         template = Image.open(self.ret['template_img_path'])
         detection= Image.open(self.ret['detection_img_path'])
-        
+
         mean_template = tuple(map(round, ImageStat.Stat(template).mean))
         mean_detection= tuple(map(round, ImageStat.Stat(detection).mean))
         self.ret['mean_template'] = mean_template
@@ -164,7 +263,7 @@ class TrainDataLoader(object):
         assert index_of_subclass < len(self.sub_class_dir), 'index_of_subclass should less than total classes'
         sub_class_dir_basename = self.sub_class_dir[index_of_subclass]
         sub_class_dir_path = os.path.join(self.img_dir_path, sub_class_dir_basename)
-        sub_class_img_name = [img_name for img_name in os.listdir(sub_class_dir_path) if not img_name.find('.jpg') == -1]        
+        sub_class_img_name = [img_name for img_name in os.listdir(sub_class_dir_path) if not img_name.find('.jpg') == -1]
         sub_class_img_name = sorted(sub_class_img_name)
         sub_class_img_num  = len(sub_class_img_name)
         sub_class_gt_name  = 'groundtruth.txt'
@@ -186,8 +285,8 @@ class TrainDataLoader(object):
                 lines = f.readlines()
             cords_of_template_abs  = [abs(int(float(i))) for i in lines[template_index].strip('\n').split(',')[:4]]
             cords_of_detection_abs = [abs(int(float(i))) for i in lines[detection_index].strip('\n').split(',')[:4]]
-            
-            if cords_of_template_abs[2]*cords_of_template_abs[3]*cords_of_detection_abs[2]*cords_of_detection_abs[3] != 0: 
+
+            if cords_of_template_abs[2]*cords_of_template_abs[3]*cords_of_detection_abs[2]*cords_of_detection_abs[3] != 0:
                 status = False
             else:
                 print('Warning : Encounter object missing, reinitializing ...')
@@ -218,7 +317,7 @@ class TrainDataLoader(object):
 
             detection = Image.open(self.ret['detection_img_path'])
             x, y, w, h = self.ret['detection_target_xywh'].copy()
-            x1, y1, x3, y3 = int(x-w//2), int(y-h//2), int(x+w//2), int(y+h//2) 
+            x1, y1, x3, y3 = int(x-w//2), int(y-h//2), int(x+w//2), int(y+h//2)
             draw = ImageDraw.Draw(detection)
             draw.line([(x1, y1), (x3, y1), (x3, y3), (x1, y3), (x1, y1)], width=1, fill='red')
             save_path = osp.join(s,'idx_{:04d}_class_{}_detection_idx_{}.jpg'.format(self.count, sub_class_dir_basename, detection_index))
@@ -232,7 +331,7 @@ class TrainDataLoader(object):
         p = round((tw + th)/2, 2)
         template_square_size  = int(np.sqrt((tw + p)*(th + p))) #a
         detection_square_size = int(template_square_size * 2)   #A =2a
-        
+
         # pad
         detection_lt_x, detection_lt_y = cx - detection_square_size//2, cy - detection_square_size//2
         detection_rb_x, detection_rb_y = cx + detection_square_size//2, cy + detection_square_size//2
@@ -248,7 +347,7 @@ class TrainDataLoader(object):
         self.ret['new_template_img_padding_size'] = (new_w, new_h)
         self.ret['new_template_img_padding'] = ImageOps.expand(template_img,  border=padding, fill=self.ret['mean_template'])
         self.ret['new_detection_img_padding']= ImageOps.expand(detection_img, border=padding, fill=self.ret['mean_detection'])
-            
+
         # crop
         tl = cx + left - template_square_size//2
         tt = cy + top  - template_square_size//2
@@ -259,19 +358,19 @@ class TrainDataLoader(object):
         dl = np.clip(cx + left - detection_square_size//2, 0, new_w - detection_square_size)
         dt = np.clip(cy + top  - detection_square_size//2, 0, new_h - detection_square_size)
         dr = np.clip(new_w - dl - detection_square_size, 0, new_w - detection_square_size)
-        db = np.clip(new_h - dt - detection_square_size, 0, new_h - detection_square_size ) 
-        self.ret['detection_cropped']= ImageOps.crop(self.ret['new_detection_img_padding'].copy(), (dl, dt, dr, db))  
+        db = np.clip(new_h - dt - detection_square_size, 0, new_h - detection_square_size )
+        self.ret['detection_cropped']= ImageOps.crop(self.ret['new_detection_img_padding'].copy(), (dl, dt, dr, db))
 
         self.ret['detection_tlcords_of_original_image'] = (cx - detection_square_size//2 , cy - detection_square_size//2)
         self.ret['detection_tlcords_of_padding_image']  = (cx - detection_square_size//2 + left, cy - detection_square_size//2 + top)
         self.ret['detection_rbcords_of_padding_image']  = (cx + detection_square_size//2 + left, cy + detection_square_size//2 + top)
-        
+
         # resize
         self.ret['template_cropped_resized'] = self.ret['template_cropped'].copy().resize((127, 127))
         self.ret['detection_cropped_resized']= self.ret['detection_cropped'].copy().resize((256, 256))
         self.ret['template_cropprd_resized_ratio'] = round(127/template_square_size, 2)
         self.ret['detection_cropped_resized_ratio'] = round(256/detection_square_size, 2)
-        
+
         # compute target in detection, and then we will compute IOU
         # whether target in detection part
         x, y, w, h = self.ret['detection_target_xywh']
@@ -293,9 +392,9 @@ class TrainDataLoader(object):
             draw.line([(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)], width=1, fill='green') # detection in padding
 
             save_path = osp.join(s, '{:04d}.jpg'.format(self.count))
-            im.save(save_path) 
+            im.save(save_path)
 
-        ### use cords of padding to compute cords about detection 
+        ### use cords of padding to compute cords about detection
         ### modify cords because not all the object in the detection
         x11, y11 = self.ret['detection_tlcords_of_padding_image']
         x12, y12 = self.ret['detection_rbcords_of_padding_image']
@@ -342,16 +441,16 @@ class TrainDataLoader(object):
         pos, neg = self.anchor_generator.pos_neg_anchor(gt_box_in_detection)
         diff     = self.anchor_generator.diff_anchor_gt(gt_box_in_detection)
         pos, neg, diff = pos.reshape((-1, 1)), neg.reshape((-1,1)), diff.reshape((-1, 4))
-        class_target = np.array([-100.] * self.anchors.shape[0], np.int32) 
-        
+        class_target = np.array([-100.] * self.anchors.shape[0], np.int32)
+
         # pos
         pos_index = np.where(pos == 1)[0]
         pos_num = len(pos_index)
         self.ret['pos_anchors'] = np.array(self.ret['anchors'][pos_index, :], dtype=np.int32) if not pos_num == 0 else None
         if pos_num > 0:
             class_target[pos_index] = 1
-        
-        # neg 
+
+        # neg
         neg_index = np.where(neg == 1)[0]
         neg_num = len(neg_index)
         class_target[neg_index] = 0
@@ -361,7 +460,7 @@ class TrainDataLoader(object):
             s = osp.join(self.tmp_dir, '4_check_pos_neg_anchors')
             if not os.path.exists(s):
                 os.makedirs(s)
-            
+
             im = self.ret['detection_cropped_resized'].copy()
             draw = ImageDraw.Draw(im)
             if pos_num == 16:
@@ -370,23 +469,23 @@ class TrainDataLoader(object):
                     cx ,cy, w, h = self.anchors[index]
                     if w * h == 0:
                         print('anchor area error')
-                        sys.exit(0) 
+                        sys.exit(0)
                     x1, y1, x2, y2 = int(cx-w/2), int(cy-h/2), int(cx+w/2), int(cy+h/2)
                     draw.line([(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)], width=1, fill='red')
-            
+
             for i in range(neg_num):
                 index = neg_index[i]
                 cx ,cy, w, h = self.anchors[index]
                 x1, y1, x2, y2 = int(cx-w/2), int(cy-h/2), int(cx+w/2), int(cy+h/2)
-                draw.line([(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)], width=1, fill='green')  
+                draw.line([(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)], width=1, fill='green')
             save_path = osp.join(s, '{:04d}.jpg'.format(self.count))
             im.save(save_path)
-        
+
         #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         # when training, this part can be delete to speed up
         """
         if self.check:
-            s = osp.join(self.tmp_dir, '5_check_all_anchors') 
+            s = osp.join(self.tmp_dir, '5_check_all_anchors')
             if not os.path.exists(s):
                 os.makedirs(s)
 
@@ -402,9 +501,9 @@ class TrainDataLoader(object):
                 draw.line([(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)], width=1, fill='green')
                 save_path = osp.join(s, 'img_{:04d}_anchor_{:05d}.jpg'.format(self.count, i))
                 im.save(save_path)
-        """    
+        """
         #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    
+
         class_logits = class_target.reshape(-1, 1)
         pos_neg_diff = np.hstack((class_logits, diff))
         self.ret['pos_neg_diff'] = pos_neg_diff
@@ -431,7 +530,7 @@ class TrainDataLoader(object):
         self._tranform()
         self.count += 1
         return self.ret
-    
+
     def __len__(self):
         return len(self.sub_class_dir)
 
