@@ -23,11 +23,13 @@ from shapely.geometry import Polygon
 
 
 parser = argparse.ArgumentParser(description='PyTorch SiameseRPN Training')
-parser.add_argument('--train_path', default='/home/whikwon/Documents/github/Siamese-RPN-pytorch/vot2013/catheter', metavar='DIR',help='path to dataset')
+parser.add_argument('--train_path',
+    default='/home/whikwon/Documents/github/Siamese-RPN-pytorch/vot2013/bicycle', metavar='DIR',help='path to dataset')
 parser.add_argument('--weight_dir', default='/home/whikwon/Documents/github/Siamese-RPN-pytorch/weight', metavar='DIR',help='path to weight')
 parser.add_argument('--checkpoint_path', default=None, help='resume')
-parser.add_argument('--max_epoches', default=10000, type=int, metavar='N', help='number of total epochs to run')
+parser.add_argument('--max_epoches', default=1000, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--max_batches', default=0, type=int, metavar='N', help='number of batch in one epoch')
+parser.add_argument('--batch_size', default=8, type=int, metavar='N', help='batch size')
 parser.add_argument('--init_type',  default='xavier', type=str, metavar='INIT', help='init net')
 parser.add_argument('--lr', default=0.001, type=float, metavar='LR', help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='momentum', help='momentum')
@@ -78,11 +80,16 @@ def main():
     for epoch in range(start, args.max_epoches):
         cur_lr = adjust_learning_rate(args.lr, optimizer, epoch, gamma=0.1)
         index_list = range(data_loader.__len__())
-        for example in range(args.max_batches):
-            ret = data_loader.__get__(random.choice(index_list))
-            template = ret['template_tensor'].cuda()
-            detection= ret['detection_tensor'].cuda()
-            pos_neg_diff = ret['pos_neg_diff_tensor'].cuda()
+        for example in range(args.max_batches // args.batch_size):
+            template = []
+            detection = []
+            pos_neg_diff = []
+            for i in range(args.batch_size):
+                ret = data_loader.__get__(random.choice(index_list))
+                template.append(ret['template_tensor'].cuda())
+                detection.append(ret['detection_tensor'].cuda())
+                pos_neg_diff.append(ret['pos_neg_diff_tensor'].cuda())
+
             cout, rout = model(template, detection)
             predictions, targets = (cout, rout), pos_neg_diff
             closs, rloss, loss, reg_pred, reg_target, pos_index, neg_index = criterion(predictions, targets)
@@ -98,9 +105,10 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            steps += 1
+            steps += args.batch_size
 
             cout = cout.cpu().detach().numpy()
+            print("Cout", cout.shape)
             score = 1/(1 + np.exp(cout[:,0]-cout[:,1]))  # ?
 
             # ++++++++++++ post process below just for debug ++++++++++++++++++++++++
@@ -211,7 +219,6 @@ def main():
             save_path = osp.join(tmp_dir, 'epoch_{:010d}_{:010d}_anchor_pred.jpg'.format(epoch, example))
             detection.save(save_path)
 
-
             # +++++++++++++++++++ v1.0 restore ++++++++++++++++++++++++++++++++++++++++
             ratio = ret['detection_cropped_resized_ratio']
             detection_cropped = ret['detection_cropped'].copy()
@@ -235,14 +242,14 @@ def main():
 
             print("Epoch:{:04d}\texample:{:06d}/{:06d}({:.2f})%\tsteps:{:010d}\tlr:{:.7f}\tcloss:{:.4f}\trloss:{:.4f}\ttloss:{:.4f}".format(epoch, example+1, args.max_batches, 100*(example+1)/args.max_batches, steps, cur_lr, closses.avg, rlosses.avg, tlosses.avg ))
 
-        if steps % 10 == 0:
-            file_path = os.path.join(args.weight_dir, 'weights-{:07d}.pth.tar'.format(steps))
-            state = {
-            'epoch' :epoch+1,
-            'state_dict' :model.state_dict(),
-            'optimizer' : optimizer.state_dict(),
-            }
-            torch.save(state, file_path)
+        # save every epoch
+        file_path = os.path.join(args.weight_dir, 'weights-{:07d}.pth.tar'.format(steps))
+        state = {
+        'epoch' :epoch+1,
+        'state_dict' :model.state_dict(),
+        'optimizer' : optimizer.state_dict(),
+        }
+        torch.save(state, file_path)
 
 def intersection(g, p):
     g = Polygon(g[:8].reshape((4, 2)))
@@ -314,13 +321,13 @@ class MultiBoxLoss(nn.Module):
         pos_num, neg_num         = len(pos_index), len(neg_index)
         class_pred, class_target = class_pred[pos_index + neg_index], class_target[pos_index + neg_index]
 
-        closs = F.cross_entropy(class_pred, class_target, size_average=False, reduce=False)
+        closs = F.cross_entropy(class_pred, class_target, reduction='mean')
         closs = torch.div(torch.sum(closs), 64)
 
         """ regression """
         reg_pred = rout
         reg_target = targets[:, 1:]
-        rloss = F.smooth_l1_loss(reg_pred, reg_target, size_average=False, reduce=False) #1445, 4
+        rloss = F.smooth_l1_loss(reg_pred, reg_target, reduction='mean') #1445, 4
         rloss = torch.div(torch.sum(rloss, dim = 1), 4)
         rloss = torch.div(torch.sum(rloss[pos_index]), 16)
 
@@ -353,5 +360,3 @@ def adjust_learning_rate(lr, optimizer, epoch, gamma=0.1):
 
 if __name__ == '__main__':
     main()
-
-
